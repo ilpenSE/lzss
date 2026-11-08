@@ -26,19 +26,58 @@ typedef struct {
   } as;
 } Token;
 
-String lzss_encode(const char *input, size_t size)
+typedef struct {
+  size_t length;
+  size_t distance;
+} LenDistPair;
+
+LenDistPair find_match_kmp(const char *buf, size_t size, size_t i)
 {
-  BitWriter bw = bw_new(16);
+  size_t m = size - i < MAX_MATCH ? size - i : MAX_MATCH;
+  if (m < MIN_MATCH || i == 0) return (LenDistPair){0, 0};
+
+  const char *pat = buf + i;
+  size_t kmp_table[MAX_MATCH] = {0};
+  for (size_t q = 1, k = 0; q < m; q++) {
+    while (k > 0 && pat[k] != pat[q]) k = kmp_table[k - 1];
+    if (pat[k] == pat[q]) k++;
+    kmp_table[q] = k;
+  }
+
+  size_t start = i > WINDOW ? i - WINDOW : 0;
+  size_t end = i + m - 1;
+  size_t best_l = 0, best_d = 0;
+  for (size_t j = start, k = 0; j < end; j++) {
+    while (k > 0 && (k == m || pat[k] != buf[j])) k = kmp_table[k - 1];
+    if (pat[k] == buf[j]) k++;
+
+    size_t t = j + 1 - k;
+    if (t < i && k > best_l) { best_l = k; best_d = i - t; }
+    if (k == m) break;
+  }
+
+  return (LenDistPair){.length=best_l, .distance=best_d};
+}
+
+LenDistPair find_match_brute_force(const char *buf, size_t size, size_t i)
+{
+  size_t best_l = 0, best_d = 0;
+  size_t start = i > WINDOW ? i - WINDOW : 0;
+  for (size_t j = start; j < i; j++) {
+    size_t k = 0;
+    while (k < MAX_MATCH && i + k < size && buf[j + k] == buf[i + k]) k++;
+    if (k > best_l) { best_l = k; best_d = i - j; }
+  }
+  return (LenDistPair){.length=best_l, .distance=best_d};
+}
+
+String lzss_encode(const char *input, size_t size, LenDistPair (*find_match_fn)(const char *, size_t, size_t))
+{
+  BitWriter bw = bw_new(32);
   size_t i = 0;
   while (i < size) {
-    size_t best_l = 0, best_d = 0;
-    size_t start = i > WINDOW ? i - WINDOW : 0;
-
-    for (size_t j = start; j < i; j++) {
-      size_t k = 0;
-      while (k < MAX_MATCH && i + k < size && input[j + k] == input[i + k]) k++;
-      if (k > best_l) { best_l = k; best_d = i - j; }
-    }
+    LenDistPair p = find_match_fn(input, size, i);
+    size_t best_l = p.length, best_d = p.distance;
 
     if (best_l >= MIN_MATCH) {
       bw_put(&bw, 1);
@@ -51,7 +90,8 @@ String lzss_encode(const char *input, size_t size)
       i++;
     }
   }
-  return (String){.data=(char*)bw.buf, .count=bw_count(&bw), .capacity=bw.capacity};
+
+  return (String){.data=(char *)bw.buf, .count=bw_count(&bw), .capacity=bw.capacity};
 }
 
 String lzss_decode(const char *buffer, size_t size)
@@ -92,12 +132,15 @@ bool decode_file(const char *input_file, const char *output_file)
 bool codec_file(const char *input_file, const char *output_file_, bool encode)
 {
   String content = read_entire_file(input_file);
+  if (STR_ISINVALID(content)) return false;
+
   String output;
   if (encode) {
-    output = lzss_encode(content.data, content.count);
+    output = lzss_encode(content.data, content.count, &find_match_brute_force);
   } else {
     output = lzss_decode(content.data, content.count);
   }
+  if (STR_ISINVALID(output)) return false;
   size_t orig_bytes = content.count;
   str_free(&content);
 
@@ -187,22 +230,22 @@ int main(int argc, char **argv)
 String read_entire_file(const char *file_name)
 {
   FILE *f = fopen(file_name, "rb");
-  if (!f) return (String){0};
-  if (fseek(f, 0, SEEK_END) != 0) return (String){0};
+  if (!f) return STR_INVALID;
+  if (fseek(f, 0, SEEK_END) != 0) return STR_INVALID;
   long n = ftell(f);
-  if (n < 0) return (String){0};
+  if (n < 0) return STR_INVALID;
   size_t file_size = (size_t)n;
-  if (fseek(f, 0, SEEK_SET) != 0) return (String){0};
+  if (fseek(f, 0, SEEK_SET) != 0) return STR_INVALID;
 
   String res = str_new(file_size + 1);
 
   size_t bytes_read = fread(res.data, 1, file_size, f);
   if (bytes_read == 0) {
-    if (feof(f) || ferror(f)) return (String){0};
+    if (feof(f) || ferror(f)) return STR_INVALID;
   }
   res.count = bytes_read;
 
-  if (fclose(f) != 0) return (String){0};
+  if (fclose(f) != 0) return STR_INVALID;
   return res;
 }
 
