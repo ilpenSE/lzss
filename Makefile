@@ -4,7 +4,7 @@ BUILD ?= build
 EXE   ?= lzss
 
 # Options to configure output executable
-r    ?= 0
+r    ?= 1
 asan ?= 0
 msan ?= 0
 

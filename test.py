@@ -2,7 +2,7 @@
 
 import subprocess
 
-def run_cmd(cmd, log=True, stdout=True, stderr=True):
+def run_cmd(cmd, log=True, stdout=True, stderr=True) -> int:
   if log:
     print(f"Command: { ' '.join(cmd) }")
   try:
@@ -10,18 +10,19 @@ def run_cmd(cmd, log=True, stdout=True, stderr=True):
     stderr_param = None if stderr else subprocess.DEVNULL
     subprocess.run(cmd, check=True, stdout=stdout_param, stderr=stderr_param)
   except subprocess.CalledProcessError as e:
-    print(f"ERROR: Command failed with {e.returncode}")
+    if log:
+      print(f"ERROR: Command failed with {e.returncode}")
+    return e.returncode
+  return 0
 
-input_file = "main.c"
+input_files = ["main.c", "lorem.txt"]
+algs = ["brute", "kmp", "hash_chain"]
+binary = "./build/lzss"
+trash_folder = "./trash"
 
-# Measure performance
-run_cmd(["perf", "stat", "-r", "10", "./build/lzss_kmp", "-e", input_file, "-o", "kmp.enc"])
-run_cmd(["perf", "stat", "-r", "10", "./build/lzss_brute", "-e", input_file, "-o", "brute.enc"])
-
-# Confirm kmp's output
-run_cmd(["./build/lzss_kmp", "-d", "kmp.enc", "-o", "kmp.dec"])
-run_cmd(["diff", input_file, "kmp.dec"]) # Should not be outputting
-
-# Confirm brute's output
-run_cmd(["./build/lzss_brute", "-d", "brute.enc", "-o", "brute.dec"])
-run_cmd(["diff", input_file, "brute.dec"]) # Should not be outputting
+for input_file in input_files:
+  for alg in algs:
+    run_cmd(["perf", "stat", "-r", "10", binary, "--encode", "--algorithm", alg, input_file, "-o", f"{trash_folder}/{alg}.enc"])
+    run_cmd([f"./build/lzss", "--decode", f"{trash_folder}/{alg}.enc", "-o", f"{trash_folder}/{alg}.dec"])
+    if run_cmd(["diff", input_file, f"{trash_folder}/{alg}.dec"], stdout=False, stderr=False) != 0:
+      print(f"ERROR: {alg} is failing for file '{input_file}'")

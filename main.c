@@ -15,6 +15,38 @@
 #define MIN_MATCH 3
 #define MAX_MATCH 258
 
+#define FIND_MATCH_ALGORITHMS \
+  X("brute", "Check every single character on every iteration, dumbest", ALG_BRUTE) \
+  X("kmp", "Brute force with KMP optimization, instead of going back if match fails and check that characters again every single time, skip them next time", ALG_KMP) \
+  X("hash_chain", "Hash 3 character and lookup if that hash ever exists somewhere in hash tables", ALG_HASH_CHAIN)
+
+typedef enum {
+  ALG_NONE = 0,
+#define X(_1, _2, en) en,
+FIND_MATCH_ALGORITHMS
+#undef X
+} FindMatchAlgorithm;
+
+const char *find_match_algo_to_cstr(FindMatchAlgorithm alg)
+{
+  switch (alg) {
+#define X(str_name, _1, enum_name) case enum_name: return str_name;
+FIND_MATCH_ALGORITHMS
+#undef X
+  default: return NULL;
+  }
+}
+
+FindMatchAlgorithm cstr_to_find_match_algo(const char *cstr)
+{
+#define X(str_name, _1, enum_name) if (strcmp(cstr, str_name) == 0) return enum_name;
+FIND_MATCH_ALGORITHMS
+#undef X
+  return ALG_NONE;
+}
+
+FindMatchAlgorithm find_match_algo = ALG_NONE;
+
 typedef struct {
   bool is_match;
   union {
@@ -30,6 +62,8 @@ typedef struct {
   size_t length;
   size_t distance;
 } LenDistPair;
+
+typedef LenDistPair(*find_match_alg_fn_t)(const char *, size_t, size_t);
 
 LenDistPair find_match_kmp(const char *buf, size_t size, size_t i)
 {
@@ -71,24 +105,76 @@ LenDistPair find_match_brute_force(const char *buf, size_t size, size_t i)
   return (LenDistPair){.length=best_l, .distance=best_d};
 }
 
-String lzss_encode(const char *input, size_t size, LenDistPair (*find_match_fn)(const char *, size_t, size_t))
+#define HASH_BITS 15
+#define HASH_SIZE (1 << HASH_BITS)
+
+int head_hash_chain[HASH_SIZE];
+int prev_hash_chain[WINDOW];
+
+int lzss_hash(const unsigned char *p)
+{
+  return ((p[0] << 10) ^ (p[1] << 5) ^ p[2]) & (HASH_SIZE - 1);
+}
+
+void insert_hash_chain(const unsigned char *buf, size_t size, size_t p)
+{
+  if (p + 3 > size) return;
+  unsigned h = lzss_hash(buf + p);
+  prev_hash_chain[p % WINDOW] = head_hash_chain[h];
+  head_hash_chain[h] = p;
+}
+
+LenDistPair find_match_hash_chain(const char *buf, size_t size, size_t i)
+{
+  enum { MAX_CHAIN = 128 };
+  size_t best_l = 0, best_d = 0;
+  if (i + 3 > size) return (LenDistPair){0, 0};
+
+  int cand = head_hash_chain[lzss_hash((const unsigned char *)(buf + i))];
+  int chain = 0;
+  while (cand >= 0 && i - cand <= WINDOW && chain++ < MAX_CHAIN) {
+    size_t k = 0;
+    while (k < MAX_MATCH && i + k < size && buf[i + k] == buf[cand + k]) k++;
+    if (k > best_l) { best_l = k; best_d = i - cand; }
+    if (k == MAX_MATCH) break;
+    cand = prev_hash_chain[cand % WINDOW];
+  }
+
+  return (LenDistPair){.length=best_l, .distance=best_d};
+}
+
+find_match_alg_fn_t get_find_match_algo_fn(FindMatchAlgorithm alg)
+{
+  switch (alg) {
+  case ALG_BRUTE: return &find_match_brute_force;
+  case ALG_KMP: return &find_match_kmp;
+  case ALG_HASH_CHAIN: return &find_match_hash_chain;
+  default: return NULL;
+  }
+}
+
+String lzss_encode(const char *input, size_t size, find_match_alg_fn_t find_match_fn)
 {
   BitWriter bw = bw_new(32);
   size_t i = 0;
   while (i < size) {
     LenDistPair p = find_match_fn(input, size, i);
-    size_t best_l = p.length, best_d = p.distance;
+    size_t adv = p.length >= MIN_MATCH ? p.length : 1;
 
-    if (best_l >= MIN_MATCH) {
+    if (p.length >= MIN_MATCH) {
       bw_put(&bw, 1);
-      bw_puts(&bw, (uint8_t)(best_l - 3), 8);
-      bw_puts(&bw, (uint16_t)best_d, 16);
-      i += best_l;
+      bw_puts(&bw, (uint8_t)(p.length - 3), 8);
+      bw_puts(&bw, (uint16_t)p.distance, 16);
     } else {
       bw_put(&bw, 0);
       bw_puts(&bw, (unsigned char)input[i], 8);
-      i++;
     }
+
+    if (find_match_fn == find_match_hash_chain) {
+      for (size_t q = 0; q < adv; q++) insert_hash_chain((const unsigned char *)input, size, i + q);
+    }
+
+    i += adv;
   }
 
   return (String){.data=(char *)bw.buf, .count=bw_count(&bw), .capacity=bw.capacity};
@@ -132,15 +218,22 @@ bool decode_file(const char *input_file, const char *output_file)
 bool codec_file(const char *input_file, const char *output_file_, bool encode)
 {
   String content = read_entire_file(input_file);
-  if (STR_ISINVALID(content)) return false;
+  if (STR_ISINVALID(content)) {
+    fprintf(stderr, "ERROR: Failed to read file: '%s'\n", input_file);
+    return false;
+  }
 
   String output;
   if (encode) {
-    output = lzss_encode(content.data, content.count, &find_match_brute_force);
+    output = lzss_encode(content.data, content.count, get_find_match_algo_fn(find_match_algo));
   } else {
     output = lzss_decode(content.data, content.count);
   }
-  if (STR_ISINVALID(output)) return false;
+  if (STR_ISINVALID(output)) {
+    fprintf(stderr, "ERROR: Failed to %s file: '%s'\n", (encode ? "encode" : "decode"), input_file);
+    str_free(&content);
+    return false;
+  }
   size_t orig_bytes = content.count;
   str_free(&content);
 
@@ -155,8 +248,10 @@ bool codec_file(const char *input_file, const char *output_file_, bool encode)
   }
 
   size_t written = write_entire_file(SVS(output), output_file);
-  printf("%s (%zu bytes) %s into %s (%zu bytes).\n",
+  printf("%s (%zu bytes) %s into %s (%zu bytes)",
          input_file, orig_bytes, (encode ? "encoded" : "decoded"), output_file, written);
+  if (encode) printf(", used %s algorithm.", find_match_algo_to_cstr(find_match_algo));
+  printf("\n");
   str_free(&output);
   return true;
 }
@@ -172,6 +267,11 @@ void print_usage(const char *program_name, FILE *f)
   fprintf(f, "    -d | --decode: Do decoding (inflating).\n");
   fprintf(f, "    -o | --output <output_file>: Specify output file of program.\n");
   fprintf(f, "        Optional, program'll choose a name suffixed with lzss_encoded or lzss_decoded depending on operation\n");
+  fprintf(f, "    -a | --algorithm <algorithm>: Specify the algorithm that'll be used to find matches in encoding.\n");
+  fprintf(f, "        Possible algorithms:\n");
+#define X(name, desc, _1) fprintf(f, "          " name ": " desc "\n");
+FIND_MATCH_ALGORITHMS
+#undef X
   fprintf(f, "    -h | --help: Print this help message.\n");
 }
 
@@ -181,6 +281,9 @@ int main(int argc, char **argv)
   const char *input_file = NULL; //  @NonNULL
   const char *output_file = NULL; // @NULLable
   bool encode = true;
+
+  memset(head_hash_chain, -1, sizeof(head_hash_chain));
+  memset(prev_hash_chain, -1, sizeof(prev_hash_chain));
 
   const char *arg;
   while ((arg = shift_argv(&argc, &argv)) != NULL) {
@@ -195,6 +298,26 @@ int main(int argc, char **argv)
                 program_name, (input_file ? input_file : "my_input.txt"), arg);
         print_usage(program_name, stderr);
         return 1;
+      }
+    } else if (strcmp(arg, "-a") == 0 || strcmp(arg, "--algorithm") == 0) {
+      const char *alg_str = shift_argv(&argc, &argv);
+      if (!alg_str) {
+        fprintf(stderr, "ERROR: Algorithm was not provided");
+          fprintf(stderr, "       Hint: Possible ones:\n");
+#define X(name, desc, _1) fprintf(stderr, "             " name ": " desc "\n");
+FIND_MATCH_ALGORITHMS
+#undef X
+        return 1;
+      } else {
+        find_match_algo = cstr_to_find_match_algo(alg_str);
+        if (find_match_algo == ALG_NONE) {
+          fprintf(stderr, "ERROR: Invalid find match algorithm: '%s'", alg_str);
+          fprintf(stderr, "       Hint: Possible ones:\n");
+#define X(name, desc, _1) fprintf(stderr, "             " name ": " desc "\n");
+FIND_MATCH_ALGORITHMS
+#undef X
+          return 1;
+        }
       }
     } else if (strcmp(arg, "-d") == 0 || strcmp(arg, "--decode") == 0) {
       encode = false;
@@ -219,6 +342,8 @@ int main(int argc, char **argv)
     print_usage(program_name, stderr);
     return 1;
   }
+
+  if (find_match_algo == ALG_NONE) find_match_algo = ALG_HASH_CHAIN;
 
   if (encode) {
     if (!encode_file(input_file, output_file)) return 1;
